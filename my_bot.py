@@ -70,7 +70,9 @@ def check_rate_limit(user_id):
 def remove_bg_process(image_bytes):
     import io
     from PIL import Image
-    from transparent_background import Remover
+    # Import directly from Remover module to skip GUI imports
+    from transparent_background.Remover import Remover
+    
     remover = Remover(mode='base')
     input_image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
     output_image = remover.process(input_image, type='rgba')
