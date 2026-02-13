@@ -1,1 +1,1 @@
-worker: python telegram_bg_remover.py
+worker: python my_bot.py
