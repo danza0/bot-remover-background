@@ -69,8 +69,16 @@ def check_rate_limit(user_id):
 # ========== AI REMOVAL TASK (multiprocess safe) ==========
 def remove_bg_process(image_bytes):
     import io
+    import sys
     from PIL import Image
-    # Import directly from Remover module to skip GUI imports
+    
+    # Monkey-patch to prevent GUI import
+    import types
+    fake_gui = types.ModuleType('transparent_background.gui')
+    fake_gui.gui = lambda *args, **kwargs: None
+    sys.modules['transparent_background.gui'] = fake_gui
+    
+    # Now import Remover - it won't try to load the GUI
     from transparent_background.Remover import Remover
     
     remover = Remover(mode='base')
