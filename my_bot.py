@@ -13,7 +13,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from PIL import Image
 import asyncio
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 
 # ============== SETTINGS ==============
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -35,9 +35,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ========== MODEL MULTIPROCESS ==========
+# ========== MODEL (ThreadPool for shared memory) ==========
 CPUS = os.cpu_count() or 2
-executor = ProcessPoolExecutor(max_workers=CPUS)
+executor = ThreadPoolExecutor(max_workers=min(CPUS, 4))  # Threads share memory!
+
+# Global model instance (loaded once, reused forever)
+_remover_instance = None
+_remover_lock = asyncio.Lock()
+
+async def get_remover():
+    """Lazy-load the remover model once and reuse it"""
+    global _remover_instance
+    async with _remover_lock:
+        if _remover_instance is None:
+            logger.info("🔄 Loading AI model (first time only)...")
+            import sys
+            import types
+            # Monkey-patch to prevent GUI import
+            fake_gui = types.ModuleType('transparent_background.gui')
+            fake_gui.gui = lambda *args, **kwargs: None
+            sys.modules['transparent_background.gui'] = fake_gui
+            
+            from transparent_background.Remover import Remover
+            _remover_instance = Remover(mode='base')
+            logger.info("✅ AI model loaded and cached!")
+        return _remover_instance
 
 def load_approved_users():
     if os.path.exists(DB_FILE):
@@ -66,22 +88,12 @@ def check_rate_limit(user_id):
     user_last_times[user_id].append(now)
     return True, None
 
-# ========== AI REMOVAL TASK (multiprocess safe) ==========
-def remove_bg_process(image_bytes):
+# ========== AI REMOVAL TASK (uses shared model) ==========
+def remove_bg_process(image_bytes, remover):
+    """Process image using the pre-loaded model"""
     import io
-    import sys
     from PIL import Image
     
-    # Monkey-patch to prevent GUI import
-    import types
-    fake_gui = types.ModuleType('transparent_background.gui')
-    fake_gui.gui = lambda *args, **kwargs: None
-    sys.modules['transparent_background.gui'] = fake_gui
-    
-    # Now import Remover - it won't try to load the GUI
-    from transparent_background.Remover import Remover
-    
-    remover = Remover(mode='base')
     input_image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
     output_image = remover.process(input_image, type='rgba')
     output_buffer = io.BytesIO()
@@ -285,11 +297,15 @@ async def remove_background(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
         image_bytes = await file.download_as_bytearray()
-        await processing_msg.edit_text("🤖 Removing background on separate core (fast)...")
+        
+        # Get the pre-loaded model
+        remover = await get_remover()
+        
+        await processing_msg.edit_text("🤖 Removing background (fast)...")
 
         loop = asyncio.get_running_loop()
         output_bytes = await loop.run_in_executor(
-            executor, remove_bg_process, image_bytes
+            executor, remove_bg_process, image_bytes, remover
         )
         output_buffer = io.BytesIO(output_bytes)
 
@@ -321,11 +337,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             file = await context.bot.get_file(document.file_id)
             image_bytes = await file.download_as_bytearray()
-            await processing_msg.edit_text("🤖 Removing background on separate core...")
+            
+            # Get the pre-loaded model
+            remover = await get_remover()
+            
+            await processing_msg.edit_text("🤖 Removing background...")
 
             loop = asyncio.get_running_loop()
             output_bytes = await loop.run_in_executor(
-                executor, remove_bg_process, image_bytes
+                executor, remove_bg_process, image_bytes, remover
             )
             output_buffer = io.BytesIO(output_bytes)
             usage_stats[user_id] += 1
@@ -334,7 +354,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_document(
                 document=output_buffer,
                 filename="no_background.png",
-                caption="✅ Done! (Multiprocess)"
+                caption="✅ Done! ⚡"
             )
             logger.info(f"Processed doc image for user {user_id}")
         except Exception as e:
@@ -359,27 +379,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 def main():
-    if not BOT_TOKEN:  # ✅ Correct check
+    if not BOT_TOKEN:
         print("❌ Add your bot token!")
         return
 
-    print("🤖 Starting Paid Background Remover Bot (Multi-core)...")
+    print("🤖 Starting Paid Background Remover Bot (Optimized)...")
     print(f"💰 Price: {CURRENCY}{PRICE}")
     print(f"👑 Admin ID: {ADMIN_ID}")
     print(f"✅ Approved users: {len(approved_users)}")
-    print(f"🚀 Max parallel removals: {CPUS}")
+    print(f"🚀 Max parallel removals: {min(CPUS, 4)}")
+    print(f"⚡ Using ThreadPool (shared memory)")
     print("=" * 45)
 
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    # Admin access
     application.add_handler(CommandHandler("users", admin_commands))
     application.add_handler(CommandHandler("pending", admin_commands))
     application.add_handler(CommandHandler("stats", admin_commands))
     application.add_handler(CommandHandler("adduser", admin_commands))
     application.add_handler(CommandHandler("removeuser", admin_commands))
-    # UI
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.PHOTO, remove_background))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
