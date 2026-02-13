@@ -1,0 +1,1 @@
+worker: python telegram_bg_remover.py

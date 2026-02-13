@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+approved_users.json
+*.png
+venv/
+.env
