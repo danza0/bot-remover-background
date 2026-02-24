@@ -43,6 +43,9 @@ executor = ThreadPoolExecutor(max_workers=min(CPUS, 4))  # Threads share memory!
 _remover_instance = None
 _remover_lock = asyncio.Lock()
 
+# Store pending images waiting for background choice
+pending_images = {}
+
 async def get_remover():
     """Lazy-load the remover model once and reuse it"""
     global _remover_instance
@@ -89,17 +92,35 @@ def check_rate_limit(user_id):
     return True, None
 
 # ========== AI REMOVAL TASK (uses shared model) ==========
-def remove_bg_process(image_bytes, remover):
+def remove_bg_process(image_bytes, remover, bg_color=None):
     """Process image using the pre-loaded model"""
     import io
     from PIL import Image
     
     input_image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
     output_image = remover.process(input_image, type='rgba')
+    
+    # Apply background color if specified
+    if bg_color:
+        if bg_color == "white":
+            background = Image.new('RGBA', output_image.size, (255, 255, 255, 255))
+        elif bg_color == "black":
+            background = Image.new('RGBA', output_image.size, (0, 0, 0, 255))
+        background.paste(output_image, mask=output_image.split()[3])
+        output_image = background.convert('RGB')
+    
     output_buffer = io.BytesIO()
     output_image.save(output_buffer, format='PNG', quality=100)
     output_buffer.seek(0)
     return output_buffer.getvalue()
+
+def get_bg_choice_keyboard():
+    """Returns the background choice keyboard"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔲 Transparent", callback_data="bg_transparent")],
+        [InlineKeyboardButton("⬜ White", callback_data="bg_white")],
+        [InlineKeyboardButton("⬛ Black", callback_data="bg_black")]
+    ])
 
 # ========== HANDLERS ==========
 
@@ -131,6 +152,43 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = query.from_user.id
     username = query.from_user.username or query.from_user.first_name or "Unknown"
+    
+    # Handle background color selection
+    if query.data.startswith("bg_"):
+        if user_id not in pending_images:
+            await query.message.edit_text("❌ No image found. Please send an image first.")
+            return
+        
+        bg_choice = query.data.split("_")[1]  # transparent, white, or black
+        bg_color = None if bg_choice == "transparent" else bg_choice
+        
+        image_bytes = pending_images.pop(user_id)
+        
+        await query.message.edit_text("🤖 Removing background...")
+        
+        try:
+            remover = await get_remover()
+            loop = asyncio.get_running_loop()
+            output_bytes = await loop.run_in_executor(
+                executor, remove_bg_process, image_bytes, remover, bg_color
+            )
+            output_buffer = io.BytesIO(output_bytes)
+            usage_stats[user_id] += 1
+            
+            bg_text = "transparent" if bg_color is None else bg_color
+            await query.message.delete()
+            await context.bot.send_document(
+                chat_id=user_id,
+                document=output_buffer,
+                filename="no_background.png",
+                caption=f"✅ Done! Background: {bg_text}"
+            )
+            logger.info(f"Processed image for user {user_id} with {bg_text} background")
+        except Exception as e:
+            logger.exception(f"Error: {e}")
+            await query.message.edit_text(f"❌ Error: {str(e)}")
+        return
+    
     if query.data == "show_payment":
         await query.message.reply_text(
             f"💳 *Payment Details*\n\n"
@@ -291,37 +349,23 @@ async def remove_background(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    processing_msg = await update.message.reply_text("🔄 Processing... ⏳")
-
     try:
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
-        image_bytes = await file.download_as_bytearray()
+        image_bytes = bytes(await file.download_as_bytearray())
         
-        # Get the pre-loaded model
-        remover = await get_remover()
+        # Store image and ask for background choice
+        pending_images[user_id] = image_bytes
         
-        await processing_msg.edit_text("🤖 Removing background (fast)...")
-
-        loop = asyncio.get_running_loop()
-        output_bytes = await loop.run_in_executor(
-            executor, remove_bg_process, image_bytes, remover
+        await update.message.reply_text(
+            "🎨 Choose background type:",
+            reply_markup=get_bg_choice_keyboard()
         )
-        output_buffer = io.BytesIO(output_bytes)
-
-        usage_stats[user_id] += 1
-
-        await processing_msg.delete()
-        await update.message.reply_document(
-            document=output_buffer,
-            filename="no_background.png",
-            caption="✅ Done! For best results, send as file."
-        )
-        logger.info(f"Processed image for user {user_id}")
+        logger.info(f"Image received from user {user_id}, waiting for bg choice")
 
     except Exception as e:
         logger.exception(f"Error: {e}")
-        await processing_msg.edit_text(f"❌ Error: {str(e)}\nIf this keeps happening, contact support.")
+        await update.message.reply_text(f"❌ Error: {str(e)}\nIf this keeps happening, contact support.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -331,35 +375,31 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    allowed, wait_secs = check_rate_limit(user_id)
+    if not allowed:
+        await update.message.reply_text(
+            f"⏳ Please wait {int(wait_secs/60)+1} minutes before sending more images (limit {USER_RATE_LIMIT}/hr)."
+        )
+        return
+
     document = update.message.document
     if document.mime_type and document.mime_type.startswith('image/'):
-        processing_msg = await update.message.reply_text("🔄 Processing HD image...")
         try:
             file = await context.bot.get_file(document.file_id)
-            image_bytes = await file.download_as_bytearray()
+            image_bytes = bytes(await file.download_as_bytearray())
             
-            # Get the pre-loaded model
-            remover = await get_remover()
+            # Store image and ask for background choice
+            pending_images[user_id] = image_bytes
             
-            await processing_msg.edit_text("🤖 Removing background...")
-
-            loop = asyncio.get_running_loop()
-            output_bytes = await loop.run_in_executor(
-                executor, remove_bg_process, image_bytes, remover
+            await update.message.reply_text(
+                "🎨 Choose background type:",
+                reply_markup=get_bg_choice_keyboard()
             )
-            output_buffer = io.BytesIO(output_bytes)
-            usage_stats[user_id] += 1
-
-            await processing_msg.delete()
-            await update.message.reply_document(
-                document=output_buffer,
-                filename="no_background.png",
-                caption="✅ Done! ⚡"
-            )
-            logger.info(f"Processed doc image for user {user_id}")
+            logger.info(f"Doc image received from user {user_id}, waiting for bg choice")
+            
         except Exception as e:
             logger.exception(f"Error [file]: {e}")
-            await processing_msg.edit_text(f"❌ Error: {str(e)}\nTry a different image or contact support.")
+            await update.message.reply_text(f"❌ Error: {str(e)}\nTry a different image or contact support.")
     else:
         await update.message.reply_text("⚠️ Please send an image file!")
 
